@@ -1,0 +1,136 @@
+name: Build and release APK
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6.4.1
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-37.0" "build-tools;37.0.0"
+
+      - name: Read application version
+        id: version
+        shell: bash
+        run: |
+          version_name="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' app/build.gradle | head -n 1)"
+          version_code="$(sed -nE 's/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' app/build.gradle | head -n 1)"
+
+          if [[ -z "$version_name" || -z "$version_code" ]]; then
+            echo "Could not read versionName/versionCode from app/build.gradle" >&2
+            exit 1
+          fi
+
+          echo "name=$version_name" >> "$GITHUB_OUTPUT"
+          echo "code=$version_code" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version_name" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether release already exists
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "$TAG already exists; this push will only be built and tested."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Test, lint and build APKs
+        run: ./gradlew --no-daemon test lint assembleDebug assembleRelease
+
+      - name: Package release assets
+        id: package
+        if: steps.release.outputs.exists != 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.name }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          cp app/build/outputs/apk/debug/app-debug.apk \
+            "dist/usb-gadget-tool-v${VERSION}-debug.apk"
+          cp app/build/outputs/apk/release/app-release-unsigned.apk \
+            "dist/usb-gadget-tool-v${VERSION}-unsigned.apk"
+
+          signing_note="This release includes an installable debug APK and an unsigned release APK."
+          if [[ -n "$ANDROID_KEYSTORE_BASE64" && \
+                -n "$ANDROID_KEYSTORE_PASSWORD" && \
+                -n "$ANDROID_KEY_ALIAS" && \
+                -n "$ANDROID_KEY_PASSWORD" ]]; then
+            keystore="$RUNNER_TEMP/android-release-keystore"
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+
+            apksigner="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+            if [[ -z "$apksigner" ]]; then
+              echo "Android apksigner was not found." >&2
+              exit 1
+            fi
+
+            "$apksigner" sign \
+              --ks "$keystore" \
+              --ks-key-alias "$ANDROID_KEY_ALIAS" \
+              --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+              --key-pass env:ANDROID_KEY_PASSWORD \
+              --out "dist/usb-gadget-tool-v${VERSION}.apk" \
+              app/build/outputs/apk/release/app-release-unsigned.apk
+
+            "$apksigner" verify --verbose "dist/usb-gadget-tool-v${VERSION}.apk"
+            rm -f "$keystore"
+            signing_note="This release includes a signed release APK, an installable debug APK, and an unsigned APK for downstream signing."
+          elif [[ -n "$ANDROID_KEYSTORE_BASE64$ANDROID_KEYSTORE_PASSWORD$ANDROID_KEY_ALIAS$ANDROID_KEY_PASSWORD" ]]; then
+            echo "Signing secrets are incomplete; configure all four ANDROID_* secrets." >&2
+            exit 1
+          fi
+
+          (cd dist && sha256sum *.apk > SHA256SUMS.txt)
+          echo "note=$signing_note" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        if: steps.release.outputs.exists != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.name }}
+          SIGNING_NOTE: ${{ steps.package.outputs.note }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "USB Gadget Tool $VERSION" \
+            --notes "$SIGNING_NOTE" \
+            --generate-notes

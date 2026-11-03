@@ -46,3 +46,21 @@ Keyboard functions set `no_out_endpoint` where the kernel supports it, because u
 ## How does it work?
 USB Gadget Tool uses ConfigFS - an userspace API inside the Linux Kernel - for creation of arbitrary USB composite devices.
 https://www.kernel.org/doc/Documentation/filesystems/configfs/configfs.txt
+
+## Automated releases
+
+Every push to `master` runs the test and APK build. If `app/build.gradle` has a
+`versionName` without a matching `v<versionName>` GitHub release, the workflow
+creates the tag and release automatically.
+
+The workflow always attaches an installable debug APK and an unsigned release
+APK. To also attach a signed release APK, configure these repository secrets:
+
+* `ANDROID_KEYSTORE_BASE64`
+* `ANDROID_KEYSTORE_PASSWORD`
+* `ANDROID_KEY_ALIAS`
+* `ANDROID_KEY_PASSWORD`
+
+`ANDROID_KEYSTORE_BASE64` must contain the Base64 encoding of the complete JKS
+or PKCS#12 keystore file. Keep the same signing key for every version so Android
+can install future releases as updates.
